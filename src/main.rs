@@ -81,6 +81,11 @@ async fn event_handler<'a>(
         } => {
             handle_message(ctx, message.clone()).await;
         }
+        FullEvent::ChannelCreate {
+            channel: _channel
+        } => {
+            ready(ctx).await;
+        }
         _ => {}
     }
     Ok(())
