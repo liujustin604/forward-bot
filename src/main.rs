@@ -1,13 +1,18 @@
 use anyhow::Context as _;
-use heapless::LinearMap;
+use nonzero_ext::nonzero;
 use poise::serenity_prelude::*;
 use poise::{CreateReply, FrameworkContext};
 use shuttle_runtime::SecretStore;
+use std::collections::HashMap;
+use std::mem::replace;
 use std::num::NonZeroU64;
+use std::ops::DerefMut;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::OnceCell;
+use tokio::join;
+use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tracing::log::warn;
+
 // the comment sets the description
 #[poise::command(slash_command)]
 /// Use this to check if the bot is alive
@@ -16,24 +21,14 @@ async fn ping(ctx: poise::Context<'_, (), Error>) -> Result<(), Error> {
     ctx.send(response).await?;
     Ok(())
 }
-const fn nonzero(x: u64) -> NonZeroU64 {
-    match NonZeroU64::new(x) {
-        Some(x) => x,
-        None => panic!("tried to unwrap a none"),
-    }
-}
-const ENTRIES: usize = 1;
-static CHANNEL_MAP: LazyLock<heapless::LinearMap<u64, &[NonZeroU64], 1>> = LazyLock::new(|| {
-    let mut map: LinearMap<u64, &[NonZeroU64], ENTRIES> = LinearMap::new();
-    // second test general => first test general
-    const SENDERS: u64 = 1294665730368737376;
-    const RECEIVERS: &'static [NonZeroU64] = &[nonzero(1294665934174294060)];
-    let _ = map
-        .insert(SENDERS, RECEIVERS)
-        .expect("Could not insert pair");
-    map
-});
-static WEBHOOK_MAP: OnceCell<LinearMap<ChannelId, Webhook, ENTRIES>> = OnceCell::const_new();
+
+const SEND_SERVER: NonZeroU64 = nonzero!(1294665730368737373_u64);
+const RECEIVE_SERVER: NonZeroU64 = nonzero!(1294665933704658975_u64);
+
+static CHANNEL_MAP: LazyLock<RwLock<HashMap<ChannelId, Vec<ChannelId>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static WEBHOOK_MAP: LazyLock<RwLock<HashMap<ChannelId, Webhook>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 #[shuttle_runtime::main]
 async fn serenity(
     #[shuttle_runtime::Secrets] secret_store: SecretStore,
@@ -84,49 +79,42 @@ async fn event_handler<'a>(
         FullEvent::Message {
             new_message: message,
         } => {
-            handle_message(ctx, message).await;
+            handle_message(ctx, message.clone()).await;
         }
         _ => {}
     }
     Ok(())
 }
 
-async fn handle_message(ctx: &Context, message: &Message) {
-    if let Some(&send_to) = CHANNEL_MAP.get(&message.channel_id.get()) {
-        let map = WEBHOOK_MAP.get().expect("Failed to get webhooks");
+async fn handle_message(ctx: &Context, message: Message) {
+    if let Some(send_to) = CHANNEL_MAP.read().await.get(&message.channel_id) {
         for x in send_to {
-            send_message(&ctx, message, map, x).await;
+            send_message(&ctx, &message, *x).await;
         }
     }
 }
 
-async fn send_message(
-    ctx: &&Context,
-    message: &Message,
-    map: &LinearMap<ChannelId, Webhook, 1>,
-    x: &NonZeroU64,
-) {
+async fn send_message(ctx: &&Context, message: &Message, x: ChannelId) {
+    let message = message.clone();
+    let author = message.author;
     let builder = ExecuteWebhook::new()
-        .content(message.content.clone())
-        .username(message.author.name.clone())
+        .content(&message.content)
+        .username(&author.name)
         .avatar_url(
-            message
-                .author
+            author
                 .avatar_url()
                 .unwrap_or_else(|| "https://cdn.discordapp.com/embed/avatars/1.png".into()),
         )
         .embeds(
             message
                 .embeds
-                .iter()
-                .cloned()
+                .into_iter()
                 .map(|x| x.into())
                 .collect::<Vec<CreateEmbed>>(),
         )
-        .files(handle_attachment(ctx, message).await);
-    let webhook = map
-        .get(&ChannelId::from(*x))
-        .expect("Failed to get webhook from map");
+        .files(handle_attachment(ctx, &message.attachments).await);
+    let webhook_map = WEBHOOK_MAP.read().await;
+    let webhook = webhook_map.get(&x).expect("Failed to get webhook from map");
     webhook
         .execute(&ctx.http, false, builder)
         .await
@@ -135,11 +123,11 @@ async fn send_message(
 
 async fn handle_attachment(
     ctx: &Context,
-    message: &Message,
+    attachments: &[Attachment],
 ) -> impl IntoIterator<Item = CreateAttachment> {
     let mut set = JoinSet::new();
 
-    message.attachments.iter().cloned().for_each(|x| {
+    attachments.iter().for_each(|x| {
         set.spawn(attachment_from_url(ctx.http.clone(), x.url.clone()));
     });
 
@@ -153,18 +141,61 @@ async fn handle_attachment(
     })
 }
 
-async fn ready(_ctx: &Context) {
-    init_webhooks(_ctx.http.clone()).await
+async fn ready(ctx: &Context) {
+    discover_channels(&ctx.http, SEND_SERVER.into(), RECEIVE_SERVER.into()).await;
+    init_webhooks(&ctx.http).await
 }
-async fn init_webhooks(http: Arc<Http>) {
-    let mut map: LinearMap<_, _, ENTRIES> = LinearMap::new();
-    for (_, channels) in CHANNEL_MAP.iter() {
-        for id in *channels {
-            let channel_id = ChannelId::from(*id);
-            let webhooks = channel_id
-                .webhooks(&http)
-                .await
-                .expect(&format!("Could not fetch webhooks for channel {id}"));
+async fn discover_channels(http: &Arc<Http>, sender_id: GuildId, receiver_id: GuildId) {
+    let (send_channels, receive_channels) =
+        join!(sender_id.channels(http), receiver_id.channels(http));
+    let sender = send_channels.expect("could not discover channels");
+    let receiver = receive_channels.expect("could not discover channels");
+    let mut new_map = HashMap::new();
+    for (sender_id, sender_channel) in sender
+        .into_iter()
+        .filter(|(_, a)| a.kind != ChannelType::Category)
+    {
+        match receiver
+            .values()
+            /* needed so that you don't get channels that will cause errors in webhook creation */
+            .filter(|x| x.kind != ChannelType::Category)
+            .find(|x| x.name().contains(&sender_id.to_string()))
+        {
+            Some(x) => {
+                new_map.insert(sender_id, vec![x.into()]);
+            }
+            None => {
+                // No channel exists in target server so create one
+                let channel =
+                    CreateChannel::new(format!("{}-{}", sender_channel.name(), sender_id))
+                        .kind(sender_channel.kind);
+                let channel = match receiver_id.create_channel(http, channel).await {
+                    Ok(x) => x,
+                    Err(e) => match e {
+                        Error::Model(ModelError::InvalidPermissions {
+                            required,
+                            present: _,
+                        }) => {
+                            panic!("need {required} in receiving server")
+                        }
+                        e => panic!("{:?}", e),
+                    },
+                };
+                new_map.insert(sender_id, vec![channel.id]);
+            }
+        }
+    }
+    let mut guard = CHANNEL_MAP.write().await;
+    let _ = replace(guard.deref_mut(), new_map);
+}
+async fn init_webhooks(http: &Arc<Http>) {
+    let channel_map = CHANNEL_MAP.read().await;
+    let mut map: HashMap<ChannelId, Webhook> = HashMap::with_capacity(channel_map.len());
+    for (_, channels) in channel_map.iter() {
+        for &channel_id in channels {
+            let webhooks = channel_id.webhooks(&http).await.unwrap_or_else(|x| {
+                panic!("Could not fetch webhooks for channel {channel_id} {channel_map:?}: {x:?}")
+            });
             let webhook = match webhooks.into_iter().find(|x| x.token.is_some()) {
                 Some(x) => x,
                 None => {
@@ -175,11 +206,11 @@ async fn init_webhooks(http: Arc<Http>) {
                         .expect("Tried to create webhook for channel without one, but failed")
                 }
             };
-            map.insert(channel_id, webhook)
-                .expect("Could not add webhook");
+            map.insert(channel_id, webhook);
         }
     }
-    WEBHOOK_MAP.set(map).expect("Failed to set webhooks");
+    let mut guard = WEBHOOK_MAP.write().await;
+    let _ = replace(guard.deref_mut(), map);
 }
 pub async fn attachment_from_url(http: impl AsRef<Http>, url: String) -> Result<CreateAttachment> {
     CreateAttachment::url(http, &url).await
