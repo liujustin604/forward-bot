@@ -4,7 +4,7 @@ use poise::serenity_prelude::*;
 use poise::{CreateReply, FrameworkContext};
 use shuttle_runtime::SecretStore;
 use std::collections::HashMap;
-use std::mem::replace;
+use std::mem;
 use std::num::NonZeroU64;
 use std::ops::DerefMut;
 use std::sync::{Arc, LazyLock};
@@ -24,11 +24,12 @@ async fn ping(ctx: poise::Context<'_, (), Error>) -> Result<(), Error> {
 
 const SEND_SERVER: NonZeroU64 = nonzero!(1294665730368737373_u64);
 const RECEIVE_SERVER: NonZeroU64 = nonzero!(1294665933704658975_u64);
-
-static CHANNEL_MAP: LazyLock<RwLock<HashMap<ChannelId, Vec<ChannelId>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-static WEBHOOK_MAP: LazyLock<RwLock<HashMap<ChannelId, Webhook>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+#[derive(Debug, Clone, Default)]
+struct ChannelMaps {
+    channel_map: HashMap<ChannelId, Vec<ChannelId>>,
+    webhook_map: HashMap<ChannelId, Webhook>,
+}
+static MAP: LazyLock<RwLock<ChannelMaps>> = LazyLock::new(|| RwLock::new(ChannelMaps::default()));
 #[shuttle_runtime::main]
 async fn serenity(
     #[shuttle_runtime::Secrets] secret_store: SecretStore,
@@ -81,9 +82,7 @@ async fn event_handler<'a>(
         } => {
             handle_message(ctx, message.clone()).await;
         }
-        FullEvent::ChannelCreate {
-            channel: _channel
-        } => {
+        FullEvent::ChannelCreate { channel: _channel } => {
             ready(ctx).await;
         }
         _ => {}
@@ -92,7 +91,7 @@ async fn event_handler<'a>(
 }
 
 async fn handle_message(ctx: &Context, message: Message) {
-    if let Some(send_to) = CHANNEL_MAP.read().await.get(&message.channel_id) {
+    if let Some(send_to) = MAP.read().await.channel_map.get(&message.channel_id) {
         for x in send_to {
             send_message(&ctx, &message, *x).await;
         }
@@ -118,7 +117,7 @@ async fn send_message(ctx: &&Context, message: &Message, x: ChannelId) {
                 .collect::<Vec<CreateEmbed>>(),
         )
         .files(handle_attachment(ctx, &message.attachments).await);
-    let webhook_map = WEBHOOK_MAP.read().await;
+    let webhook_map = &MAP.read().await.webhook_map;
     let webhook = webhook_map.get(&x).expect("Failed to get webhook from map");
     webhook
         .execute(&ctx.http, false, builder)
@@ -147,14 +146,26 @@ async fn handle_attachment(
 }
 
 async fn ready(ctx: &Context) {
-    discover_channels(&ctx.http, SEND_SERVER.into(), RECEIVE_SERVER.into()).await;
-    init_webhooks(&ctx.http).await
+    let channel_map = discover_channels(&ctx.http, SEND_SERVER.into(), RECEIVE_SERVER.into()).await;
+    let webhook_map = init_webhooks(&ctx.http, &channel_map).await;
+    let mut guard = MAP.write().await;
+    let _ = mem::replace(
+        guard.deref_mut(),
+        ChannelMaps {
+            channel_map,
+            webhook_map,
+        },
+    );
 }
-async fn discover_channels(http: &Arc<Http>, sender_id: GuildId, receiver_id: GuildId) {
+async fn discover_channels(
+    http: &Arc<Http>,
+    sender_id: GuildId,
+    receiver_id: GuildId,
+) -> HashMap<ChannelId, Vec<ChannelId>> {
     let (send_channels, receive_channels) =
         join!(sender_id.channels(http), receiver_id.channels(http));
-    let sender = send_channels.expect("could not discover channels");
-    let receiver = receive_channels.expect("could not discover channels");
+    let sender = send_channels.expect("could not discover channels in sender");
+    let receiver = receive_channels.expect("could not discover channels in receiver");
     let mut new_map = HashMap::new();
     for (sender_id, sender_channel) in sender
         .into_iter()
@@ -190,11 +201,12 @@ async fn discover_channels(http: &Arc<Http>, sender_id: GuildId, receiver_id: Gu
             }
         }
     }
-    let mut guard = CHANNEL_MAP.write().await;
-    let _ = replace(guard.deref_mut(), new_map);
+    new_map
 }
-async fn init_webhooks(http: &Arc<Http>) {
-    let channel_map = CHANNEL_MAP.read().await;
+async fn init_webhooks(
+    http: &Arc<Http>,
+    channel_map: &HashMap<ChannelId, Vec<ChannelId>>,
+) -> HashMap<ChannelId, Webhook> {
     let mut map: HashMap<ChannelId, Webhook> = HashMap::with_capacity(channel_map.len());
     for (_, channels) in channel_map.iter() {
         for &channel_id in channels {
@@ -214,8 +226,7 @@ async fn init_webhooks(http: &Arc<Http>) {
             map.insert(channel_id, webhook);
         }
     }
-    let mut guard = WEBHOOK_MAP.write().await;
-    let _ = replace(guard.deref_mut(), map);
+    map
 }
 pub async fn attachment_from_url(http: impl AsRef<Http>, url: String) -> Result<CreateAttachment> {
     CreateAttachment::url(http, &url).await
